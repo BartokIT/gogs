@@ -2,7 +2,7 @@
 
 - **Stato:** proposta
 - **Data:** 2026-10-19
-- **Decisori:** Claudio Papa
+- **Decisori:** BartokIT
 
 ## Contesto
 
