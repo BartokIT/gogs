@@ -2,6 +2,7 @@
 
 - **Stato:** proposta
 - **Data:** 2026-10-19
+- **Ultimo aggiornamento:** 2026-10-20, scelta dello storage locale (Pebble per i log, SQLite per lo stato)
 - **Decisori:** BartokIT
 
 ## Contesto
@@ -35,6 +36,8 @@ Adottiamo un'architettura a due livelli, modellata sul protocollo di replica di 
 
 Gli oggetti Git e LFS non passano mai dal consenso: viaggiano via `git fetch` (o richieste HTTP per LFS) e vengono verificati per hash. Nel consenso e nei log passano solo i loro hash.
 
+Su ogni nodo, tutti i log e i metadati di replica stanno in un'unica istanza [Pebble](https://github.com/cockroachdb/pebble), mentre lo stato relazionale materializzato dai log sta in SQLite. I dettagli sono nella sezione [Storage locale](#storage-locale).
+
 ### Controller
 
 Il controller è un gruppo Raft di 3 o 5 nodi votanti, eseguito all'interno dei normali nodi Gogs, come il "combined mode" di KRaft. Il suo log replicato contiene:
@@ -45,7 +48,7 @@ Il controller è un gruppo Raft di 3 o 5 nodi votanti, eseguito all'interno dei 
 
 Ogni nodo invia un heartbeat al controller (per esempio ogni secondo). Se un nodo non si fa sentire entro il timeout di sessione (per esempio 9 secondi, il default di Kafka), il controller lo considera morto e riassegna i primari che ospitava. Il costo del rilevamento dei guasti è quindi proporzionale al numero di nodi, non al numero di repository.
 
-Lo stato del controller viene materializzato su ogni nodo votante in un file SQLite globale. Gli snapshot Raft sono copie di quel file.
+Il log Raft del controller e il suo stato interno (termine, voto, configurazione) stanno in Pebble. Lo stato che il log descrive viene materializzato su ogni nodo votante nel database SQLite globale. Uno snapshot Raft è una copia di quel database più la coda del log successiva alla copia.
 
 ### Primario, repliche e ISR
 
@@ -128,6 +131,7 @@ Queste invarianti valgono in ogni momento. Ogni implementazione e ogni test di g
 6. **Nessuna esposizione oltre l'HW.** Un nodo non mostra ai client ref o dati del repository oltre il proprio HW.
 7. **Effetti collaterali una sola volta.** Webhook, cron, sincronizzazione dei mirror e altri effetti verso l'esterno li esegue un solo nodo: il primario per quelli di un repository, il leader del controller per quelli globali. Ogni effetto porta una chiave di idempotenza.
 8. **Determinismo.** I comandi nei log contengono valori già calcolati. Nessuna replica genera timestamp, numeri casuali o identificativi durante l'applicazione.
+9. **Applicazione atomica.** Le modifiche prodotte da una voce e l'indice "applicato fino a `seq`" vengono scritti in SQLite nella stessa transazione. Dopo un crash un nodo riprende dall'indice salvato, senza applicare due volte la stessa voce e senza saltarne nessuna.
 
 ### Dati del database
 
@@ -139,6 +143,45 @@ Il database attuale viene diviso in due parti, entrambe SQLite in puro Go (già 
 Il traffico effimero resta fuori dai log: le sessioni diventano cookie firmati, la cache resta locale con TTL brevi, e contatori come le visite o l'ultimo accesso vengono aggregati e scritti periodicamente.
 
 Le viste che attraversano molti repository (dashboard, ricerca, "le mie issue", statistiche di amministrazione) non possono più usare `JOIN` su un unico database. Diventano query distribuite sui nodi oppure indici globali aggiornati in modo asincrono.
+
+### Storage locale
+
+Ogni nodo usa due motori di storage incorporati, entrambi in puro Go, ciascuno per la forma di dati per cui è progettato.
+
+**Pebble per i log e i metadati di replica.** Un'unica istanza Pebble per nodo contiene:
+
+- il log Raft del controller e il suo stato interno.
+- i log di replica di tutti i repository ospitati dal nodo.
+- per ogni repository, l'epoca corrente, l'HW e l'ultima voce ricevuta.
+
+Le chiavi hanno un prefisso per tipo e per repository, con i numeri codificati in big-endian così che l'ordine dei byte coincida con l'ordine numerico:
+
+```text
+raft/log/<index>                 voci del log del controller
+raft/state/<nome>                termine, voto, configurazione
+repo/<repo_id>/log/<seq>         voci del log di replica
+repo/<repo_id>/meta/<nome>       epoca, HW, ultima voce ricevuta
+```
+
+Questa disposizione rende semplici le operazioni frequenti:
+
+- leggere le voci successive a una data `seq` è un iteratore su un intervallo di chiavi.
+- compattare un log o troncarlo dopo un failover è una sola cancellazione di intervallo.
+- spostare un repository su un altro nodo significa esportare il suo intervallo di chiavi in file SST e importarli a destinazione.
+- molte scritture piccole e concorrenti, di repository diversi, vengono raggruppate in un unico fsync del WAL di Pebble.
+
+**SQLite per lo stato materializzato.** Il database globale e il database locale dei repository restano SQLite, con lo schema relazionale e le query attuali di [`internal/database`](../../../internal/database). Gogs oggi ha 38 tabelle e centinaia di query con filtri, `JOIN`, ordinamenti e paginazione. Riscriverle su un modello chiave-valore non porterebbe benefici all'architettura.
+
+**Durabilità.** Una voce è al sicuro quando è nel WAL di Pebble su tutti i membri dell'ISR, oppure sulla maggioranza per il log del controller. SQLite è una materializzazione ricostruibile dai log, quindi può usare `synchronous=NORMAL` e risparmiare un fsync per scrittura. Questo vale a una condizione: i log vanno conservati almeno fino all'ultimo snapshot di SQLite. Uno snapshot completo di un nodo è una copia dei database SQLite (con `VACUUM INTO` o l'API di backup) più la coda dei log successiva alla copia.
+
+Alternative valutate per lo storage locale:
+
+| Opzione | Esito | Motivo |
+|---|---|---|
+| Solo SQLite, log inclusi | scartata | milioni di log append-only diventano tabelle enormi, con troncamenti e compattazioni riga per riga |
+| Solo Pebble, stato incluso | scartata | richiede di riscrivere tutto il livello dati di Gogs come modello chiave-valore, con indici secondari, conteggi e migrazioni gestiti a mano |
+| bbolt per i log | scartata | un solo scrittore alla volta, scritture amplificate con log grandi, e il file non si restringe dopo le cancellazioni |
+| Pebble per i log, SQLite per lo stato | **scelta** | ogni motore gestisce la forma di dati per cui è progettato, come in rqlite (log Raft in un KV, stato in SQLite) |
 
 ### Componenti di Gogs da adattare
 
@@ -284,6 +327,7 @@ Diventa più difficile:
 - le viste globali richiedono query distribuite o indici asincroni.
 - le migrazioni dello schema vanno coordinate tra nodi con versioni diverse del binario durante un aggiornamento progressivo.
 - il debug di problemi di replica richiede strumenti nuovi (stato dei log, ISR, epoche, ritardo delle repliche).
+- ogni nodo gestisce due motori di storage. Il formato su disco di Pebble si aggiorna solo in avanti, quindi un aggiornamento del binario va pianificato come una migrazione, e le chiavi dei log si ispezionano solo con strumenti dedicati.
 
 Da rivalutare in seguito:
 
@@ -297,9 +341,9 @@ Ogni fase si chiude con un criterio verificabile.
 
 1. **Preparazione su nodo singolo.** Introdurre la funzione di lookup del placement (inizialmente sempre il nodo locale), separare il database globale da quello dei repository, trasformare le scritture in comandi deterministici, passare le sessioni a cookie firmati.
    - *Criterio:* tutti i test esistenti passano, e un'installazione singola si comporta come oggi.
-2. **Controller.** Gruppo Raft su 3 nodi con il database globale, inoltro delle scritture globali al leader, cron globali solo sul leader.
+2. **Controller.** Gruppo Raft su 3 nodi con il log in Pebble e il database globale in SQLite, inoltro delle scritture globali al leader, cron globali solo sul leader.
    - *Criterio:* con 3 nodi locali, uccidere il leader durante scritture continue non perde nessuna scrittura confermata.
-3. **Log per repository.** Primario, repliche pull, ISR, HW ed epoca. Il push viene confermato nell'hook pre-receive, e le repliche seguono via `git fetch`.
+3. **Log per repository.** Primario, repliche pull, ISR, HW ed epoca, con i log nell'istanza Pebble del nodo. Il push viene confermato nell'hook pre-receive, e le repliche seguono via `git fetch`.
    - *Criterio:* dopo ogni push confermato, `git rev-parse --all` e `git fsck` danno lo stesso risultato su tutti i membri dell'ISR.
 4. **Failover e operazioni.** Fencing, troncamento per epoca, cambio pianificato del primario, ingresso e uscita dei nodi, strumenti di stato del cluster.
    - *Criterio:* isolare il primario durante push continui non produce mai due versioni diverse di un ref confermato.
@@ -310,9 +354,8 @@ Ogni fase si chiude con un criterio verificabile.
 
 ## Domande aperte
 
-- Libreria Raft per il controller: `hashicorp/raft` (API di alto livello, usata da Consul e Nomad) o `etcd-io/raft` (più flessibile, più codice da scrivere).
-- Formato su disco dei log per repository: un file per repository diventa problematico con milioni di repository, un WAL condiviso con indici per repository è più complesso.
-- Compattazione dei log per repository: lo snapshot è lo stato dei ref e delle righe del repository a una certa voce.
+- Libreria Raft per il controller: `hashicorp/raft` (API di alto livello, usata da Consul e Nomad, richiede un adattatore Pebble per `LogStore` e `StableStore`) o `etcd-io/raft` (più flessibile, con lo storage da implementare comunque, più codice da scrivere).
+- Politica di compattazione dei log per repository: ogni quante voci, o dopo quanto tempo, conservare solo la coda successiva all'ultimo snapshot di SQLite.
 - Valori di default per timeout di sessione, ritardo massimo nell'ISR e timeout di attesa dell'HW nel push.
 - Migrazione di un'installazione esistente a nodo singolo verso il cluster.
 - Politica di placement: come esprimere siti e zone nella configurazione, e come ribilanciare quando si aggiunge un nodo.
@@ -330,3 +373,4 @@ Ogni fase si chiude con un criterio verificabile.
 - `hashicorp/raft`: <https://github.com/hashicorp/raft>.
 - `etcd-io/raft`: <https://github.com/etcd-io/raft>.
 - rqlite, come riferimento per la replica di SQLite via Raft: <https://github.com/rqlite/rqlite>.
+- Pebble, il motore di storage chiave-valore di CockroachDB: <https://github.com/cockroachdb/pebble>.
