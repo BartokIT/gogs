@@ -2,7 +2,7 @@
 
 - **Status:** proposed
 - **Date:** 2026-10-19
-- **Last updated:** 2026-10-20, choice of local storage (Pebble for logs, SQLite for state)
+- **Last updated:** 2026-10-20, choice of local storage (Pebble for logs, SQLite for state) and [verification plan](../cluster/verification-plan.md)
 - **Deciders:** BartokIT
 
 ## Context
@@ -121,7 +121,7 @@ A planned primary change (e.g., to move it closer to the users who write the mos
 
 ### Safety rules
 
-These invariants hold at all times. Every implementation and every fault test verifies them.
+These invariants hold at all times. Every implementation and every fault test verifies them. The [verification plan](../cluster/verification-plan.md) maps each rule to an invariant of the [TLA+ model](../cluster/tla/README.md) and to Jepsen workloads, nemeses and checkers.
 
 1. **Clean election.** The new primary is chosen only among ISR members. A replica that is not caught up is never elected, not even manually, without an explicit administrative operation that acknowledges possible data loss.
 2. **ISR managed by the controller.** The primary may ask to remove or add a replica, but the change only takes effect once the controller records it. Otherwise a primary could commit writes on a shrunken ISR, die, and let a replica that lacks them be promoted.
@@ -337,10 +337,10 @@ To revisit later:
 
 ## Phases
 
-Each phase ends with a verifiable criterion.
+Each phase ends with a verifiable criterion. The [verification plan](../cluster/verification-plan.md#gates-by-phase) lists the TLA+ and Jepsen checks that gate each phase.
 
-1. **Single-node preparation.** Introduce the placement lookup function (initially always the local node), split the global database from the repository database, turn writes into deterministic commands, and move sessions to signed cookies.
-   - *Criterion:* all existing tests pass, and a single-node installation behaves as it does today.
+1. **Single-node preparation and design verification.** Introduce the placement lookup function (initially always the local node), split the global database from the repository database, turn writes into deterministic commands, and move sessions to signed cookies. Model-check the [TLA+ specification](../cluster/tla/README.md) of the replication protocol, and build the Jepsen suite against a single node.
+   - *Criterion:* all existing tests pass, and a single-node installation behaves as it does today. TLC finds no violation in the main model and finds the expected violation in every mutation model. The single-node Jepsen baseline passes.
 2. **Controller.** A 3-node Raft group with its log in Pebble and the global database in SQLite, global writes forwarded to the leader, and global cron jobs run only on the leader.
    - *Criterion:* with 3 local nodes, killing the leader during continuous writes loses no acknowledged write.
 3. **Per-repository log.** Primary, pull replicas, ISR, HW and epoch, with the logs in the node's Pebble instance. Pushes are acknowledged in the pre-receive hook, and replicas follow via `git fetch`.
@@ -370,6 +370,8 @@ Each phase ends with a verifiable criterion.
 - Kafka KIP-631, *The quorum-based Kafka controller*.
 - Sanjay Ghemawat, Howard Gobioff and Shun-Tak Leung, *The Google file system* (2003), for the master and leased primary model.
 - Git documentation on hooks, in particular pre-receive, reference-transaction and the quarantine environment: <https://git-scm.com/docs/githooks>.
+- TLA+: <https://lamport.azurewebsites.net/tla/tla.html>, and the Raft TLA+ specification: <https://github.com/ongardie/raft.tla>.
+- Jepsen: <https://github.com/jepsen-io/jepsen>.
 - `hashicorp/raft`: <https://github.com/hashicorp/raft>.
 - `etcd-io/raft`: <https://github.com/etcd-io/raft>.
 - rqlite, as a reference for replicating SQLite via Raft: <https://github.com/rqlite/rqlite>.
