@@ -31,7 +31,28 @@ Run the same command with each `MC_*.cfg` to check the mutations. TLC prints the
 
 ## Status
 
-The model has been written but not yet checked with TLC. Checking `MC.cfg` and every mutation model is the design gate of phase 1 in the ADR. Any violation found in `MC.cfg` must be resolved in the model and in the ADR before phase 2 starts.
+Checking `MC.cfg` and every mutation model is the design gate of phase 1 in the ADR. Any violation found in `MC.cfg` must be resolved in the model and in the ADR before phase 2 starts.
+
+Last run: 2026-10-20, TLC 2.19 (`tla2tools.jar` v1.7.4) on Java 21, 16 cores, with the bounds listed above. SANY parses the module without errors. Every model gives its expected result, so the gate is passed.
+
+| Config | Result | Distinct states | Depth | Time |
+|---|---|---|---|---|
+| `MC.cfg` | no violation of the invariants or of `CommittedMonotonic` | 70,749,618 | 34 | 3 min 12 s (12 workers) |
+| `MC_LocalIsrShrink.cfg` | `CommittedOnIsr` violated | 2,530 | 6 | under 1 s |
+| `MC_UncleanElection.cfg` | `CommittedOnIsr` violated | 7,733 | 8 | under 1 s |
+| `MC_MinIsrOne.cfg` | `CommittedDurable` violated | 15,704 | 7 | under 1 s |
+| `MC_RefsBeforeObjects.cfg` | `NoDanglingRefs` violated | 2,736 | 7 | under 1 s |
+| `MC_ExposeLeo.cfg` | `ExposedIsCommitted` violated | 60 | 4 | under 1 s |
+
+For the mutations, the counts are the states explored before TLC stopped at the first violation, and the depth is the length of the trace. Each trace shows the intended bug:
+
+- `MC_LocalIsrShrink`: the primary writes, one replica copies the entry, the primary drops the other replica from its own ISR view and commits. The controller still lists the lagging replica in the ISR.
+- `MC_UncleanElection`: the controller removes a lagging replica from the ISR, the primary commits, then the lagging replica is elected and becomes the only ISR member.
+- `MC_MinIsrOne`: the controller shrinks the ISR to the primary alone, the primary commits, crashes and loses its disk.
+- `MC_RefsBeforeObjects`: a replica appends an entry without its objects, then exposes it once the primary advances the HW.
+- `MC_ExposeLeo`: a replica exposes an entry right after copying it, before the primary commits it.
+
+TLC estimates the probability of a fingerprint collision in `MC.cfg` at about 1E-4. The run of `MC.cfg` writes about 1.5 GB to disk for the state queue and the fingerprint set.
 
 ## Not covered
 
